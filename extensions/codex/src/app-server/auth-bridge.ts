@@ -455,6 +455,7 @@ async function withCodexHomeEnvironment(
     } catch (error) {
       throw new AgentHarnessPreflightError("Codex Computer Use client provisioning failed.", {
         cause: error,
+        harnessId: "codex",
       });
     }
   }
