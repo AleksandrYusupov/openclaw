@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { listCoreGatewayMethodMetadata } from "./core-descriptors.js";
 
 const CURRENT_TRAIN_METHODS = [
+  "observability.snapshot",
   "question.request",
   "question.waitAnswer",
   "question.resolve",
