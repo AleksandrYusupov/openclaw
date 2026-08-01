@@ -510,8 +510,9 @@ Strict-mode example (block private/internal destinations by default):
 }
 ```
 
-For browser navigation, `*.example.com` permits subdomains; include
-`example.com` separately when the base domain should also be allowed.
+For browser navigation, `*.example.com` permits subdomains but not the bare
+domain; include `example.com` separately when the base domain should also be
+allowed.
 
 ## Related
 
