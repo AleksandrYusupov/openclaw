@@ -243,6 +243,7 @@ enum class GatewayMethod(
   ModelsAuthStatus("models.authStatus"),
   ModelsAuthLogout("models.authLogout"),
   ToolsCatalog("tools.catalog"),
+  ObservabilitySnapshot("observability.snapshot"),
   ToolsEffective("tools.effective"),
   ToolsInvoke("tools.invoke"),
   McpAppView("mcp.app.view"),

@@ -119,6 +119,7 @@ const CORE_GATEWAY_METHOD_SPECS: readonly CoreGatewayMethodSpec[] = [
     controlPlaneWrite: true,
   },
   { name: "tools.catalog", scope: "operator.read", since: "<=2026.7" },
+  { name: "observability.snapshot", scope: "operator.read", since: "2026.7" },
   { name: "tools.effective", scope: "operator.read", since: "<=2026.7", startup: true },
   { name: "tools.invoke", scope: "operator.write", since: "<=2026.7" },
   { name: "mcp.app.view", scope: "operator.read", since: "<=2026.7" },

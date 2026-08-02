@@ -185,6 +185,10 @@ const loadModelsProbeHandlers = lazyHandlerModule(
   () => import("./server-methods/models-probe.js"),
   (module) => module.modelsProbeHandlers,
 );
+const loadObservabilityHandlers = lazyHandlerModule(
+  () => import("./server-methods/observability.js"),
+  (module) => module.observabilityHandlers,
+);
 const loadNativeHookRelayHandlers = lazyHandlerModule(
   () => import("./server-methods/native-hook-relay.js"),
   (module) => module.nativeHookRelayHandlers,
@@ -672,6 +676,10 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
   ...createLazyCoreHandlers({
     methods: ["tools.catalog"],
     loadHandlers: loadToolsCatalogHandlers,
+  }),
+  ...createLazyCoreHandlers({
+    methods: ["observability.snapshot"],
+    loadHandlers: loadObservabilityHandlers,
   }),
   ...createLazyCoreHandlers({
     methods: ["tools.effective"],

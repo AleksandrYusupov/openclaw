@@ -1,0 +1,75 @@
+name: Observability read model CI
+
+on:
+  push:
+    branches: [main, feat/observability-read-model]
+    paths:
+      - ".github/workflows/fork-observability-ci.yml"
+      - "src/gateway/methods/core-descriptors.ts"
+      - "src/gateway/methods/core-descriptors.since.test.ts"
+      - "src/gateway/server-methods.ts"
+      - "src/gateway/server-methods/observability.ts"
+      - "src/gateway/server-methods/observability.test.ts"
+  pull_request:
+    paths:
+      - ".github/workflows/fork-observability-ci.yml"
+      - "src/gateway/methods/core-descriptors.ts"
+      - "src/gateway/methods/core-descriptors.since.test.ts"
+      - "src/gateway/server-methods.ts"
+      - "src/gateway/server-methods/observability.ts"
+      - "src/gateway/server-methods/observability.test.ts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: observability-read-model-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          install-bun: "false"
+          use-actions-cache: "true"
+
+      - name: Check formatting
+        run: >-
+          pnpm exec oxfmt --check
+          src/gateway/server-methods/observability.ts
+          src/gateway/server-methods/observability.test.ts
+          src/gateway/server-methods.ts
+          src/gateway/methods/core-descriptors.ts
+          src/gateway/methods/core-descriptors.since.test.ts
+
+      - name: Typecheck core
+        run: pnpm tsgo:core
+
+      - name: Typecheck tests
+        run: pnpm tsgo:core:test
+
+      - name: Check generated protocol
+        run: |
+          pnpm protocol:gen
+          pnpm protocol:gen:kotlin
+          git diff --exit-code -- \
+            dist/protocol.schema.json \
+            apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewayProtocol.kt \
+            apps/android/app/src/main/java/ai/openclaw/app/protocol/OpenClawProtocolConstants.kt
+
+      - name: Test gateway read model and registration
+        run: >-
+          pnpm test
+          src/gateway/server-methods/observability.test.ts
+          src/gateway/server-methods-list.test.ts
+          src/gateway/method-scopes.test.ts
+          src/gateway/methods/core-descriptors.since.test.ts
