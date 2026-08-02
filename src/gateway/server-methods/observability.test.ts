@@ -8,11 +8,11 @@ import { toolsCatalogHandlers } from "./tools-catalog.js";
 import type { GatewayRequestContext, GatewayRequestHandler } from "./types.js";
 
 const originalHandlers = {
-  agents: agentsHandlers["agents.list"],
-  skills: skillsHandlers["skills.status"],
-  tasks: tasksHandlers["tasks.list"],
-  sessions: sessionsHandlers["sessions.list"],
-  tools: toolsCatalogHandlers["tools.catalog"],
+  agents: agentsHandlers["agents.list"]!,
+  skills: skillsHandlers["skills.status"]!,
+  tasks: tasksHandlers["tasks.list"]!,
+  sessions: sessionsHandlers["sessions.list"]!,
+  tools: toolsCatalogHandlers["tools.catalog"]!,
 };
 
 afterEach(() => {

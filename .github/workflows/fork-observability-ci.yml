@@ -54,6 +54,18 @@ jobs:
       - name: Typecheck core
         run: pnpm tsgo:core
 
+      - name: Typecheck tests
+        run: pnpm tsgo:core:test
+
+      - name: Check generated protocol
+        run: |
+          pnpm protocol:gen
+          pnpm protocol:gen:kotlin
+          git diff --exit-code -- \
+            dist/protocol.schema.json \
+            apps/android/app/src/main/java/ai/openclaw/app/gateway/GatewayProtocol.kt \
+            apps/android/app/src/main/java/ai/openclaw/app/protocol/OpenClawProtocolConstants.kt
+
       - name: Test gateway read model and registration
         run: >-
           pnpm test
