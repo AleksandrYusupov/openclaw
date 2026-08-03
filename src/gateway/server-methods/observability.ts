@@ -1,8 +1,10 @@
 // Read-only observability snapshot for external inventory and activity consumers.
 import { createHash } from "node:crypto";
+import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import { createSessionMcpRuntime } from "../../agents/agent-bundle-mcp-runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { resolveCommitHash } from "../../infra/git-commit.js";
 import { agentsHandlers } from "./agents.js";
 import { sessionsHandlers } from "./sessions.js";
 import { skillsHandlers } from "./skills.js";
@@ -17,19 +19,20 @@ import type {
 
 const MAX_ACTIVITY_EVENTS = 1_000;
 const MCP_PROBE_TIMEOUT_MS = 5_000;
+const OPENCLAW_RUNTIME_REPOSITORY = "https://github.com/AleksandrYusupov/openclaw";
+const OPENCLAW_UPSTREAM_REPOSITORY = "https://github.com/openclaw/openclaw";
+const AI_DEV_TEAM_REPOSITORY = "https://github.com/AleksandrYusupov/ai-dev-team-2";
+const ONYX_REPOSITORY = "https://github.com/AleksandrYusupov/xpn-knowledge-base-onyx";
+const GIT_REVISION_PATTERN = /^[a-f0-9]{7,40}$/iu;
+const FULL_GIT_REVISION_PATTERN = /^[a-f0-9]{40}$/iu;
+const SAFE_REPOSITORY_PATH_SEGMENT = /^[a-z0-9][a-z0-9._-]*$/iu;
 
 type JsonRecord = Record<string, unknown>;
-
-function asRecord(value: unknown): JsonRecord | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as JsonRecord)
-    : null;
-}
 
 function records(value: unknown, key: string): JsonRecord[] {
   const source = asRecord(value)?.[key];
   return Array.isArray(source)
-    ? source.map(asRecord).filter((item): item is JsonRecord => item !== null)
+    ? source.map(asRecord).filter((item): item is JsonRecord => item !== undefined)
     : [];
 }
 
@@ -45,6 +48,172 @@ function safeStringArray(value: unknown): string[] {
         .map((item) => item.trim())
         .filter(Boolean)
     : [];
+}
+
+function buildRuntimeRepository(revision = resolveCommitHash({ moduleUrl: import.meta.url })) {
+  const candidate = revision?.trim().toLowerCase() ?? "";
+  return {
+    provenanceType: "runtime",
+    verified: true,
+    provider: "github",
+    status: "verified",
+    url: OPENCLAW_RUNTIME_REPOSITORY,
+    revision: GIT_REVISION_PATTERN.test(candidate) ? candidate : null,
+    path: null,
+  };
+}
+
+function normalizeSkillOrigin(skill: JsonRecord): string {
+  if (skill.bundled === true && skill.source === "openclaw-bundled") {
+    return "bundled";
+  }
+  const clawhub = asRecord(skill.clawhub);
+  if (clawhub?.valid === true && clawhub.status === "linked") {
+    return "clawhub";
+  }
+  switch (skill.source) {
+    case "openclaw-managed":
+      return "managed";
+    case "openclaw-workspace":
+      return "workspace";
+    case "agents-skills-project":
+      return "project";
+    case "agents-skills-personal":
+      return "personal";
+    case "openclaw-extra":
+      return "extra";
+    case "openclaw-node":
+      return "remote";
+    default:
+      return "unknown";
+  }
+}
+
+function bundledSkillRepository(skill: JsonRecord, runtimeRevision: string | null) {
+  if (skill.bundled !== true || skill.source !== "openclaw-bundled") {
+    return null;
+  }
+  const rawPath = typeof skill.filePath === "string" ? skill.filePath.trim() : "";
+  const normalized = rawPath.replaceAll("\\", "/");
+  const marker = "/skills/";
+  const markerIndex = normalized.lastIndexOf(marker);
+  const relativePath = markerIndex >= 0 ? normalized.slice(markerIndex + 1) : normalized;
+  const segments = relativePath.split("/");
+  if (
+    segments.length !== 3 ||
+    segments[0] !== "skills" ||
+    segments[2] !== "SKILL.md" ||
+    !SAFE_REPOSITORY_PATH_SEGMENT.test(segments[1] ?? "")
+  ) {
+    return null;
+  }
+  return {
+    provenanceType: "definition",
+    verified: true,
+    provider: "github",
+    status: "verified",
+    url: OPENCLAW_RUNTIME_REPOSITORY,
+    revision: runtimeRevision,
+    path: segments.join("/"),
+  };
+}
+
+const VERIFIED_REPOSITORIES = new Map(
+  [
+    OPENCLAW_RUNTIME_REPOSITORY,
+    OPENCLAW_UPSTREAM_REPOSITORY,
+    AI_DEV_TEAM_REPOSITORY,
+    ONYX_REPOSITORY,
+  ].map((url) => [url.toLowerCase(), url]),
+);
+
+function trackedSkillRepository(skill: JsonRecord) {
+  const clawhub = asRecord(skill.clawhub);
+  if (clawhub?.valid !== true || clawhub.status !== "linked") {
+    return null;
+  }
+  const rawSourceUrl = typeof clawhub.sourceUrl === "string" ? clawhub.sourceUrl.trim() : "";
+  let sourceUrl: URL;
+  try {
+    sourceUrl = new URL(rawSourceUrl);
+  } catch {
+    return null;
+  }
+  if (
+    sourceUrl.protocol !== "https:" ||
+    sourceUrl.hostname !== "github.com" ||
+    sourceUrl.username ||
+    sourceUrl.password ||
+    sourceUrl.search ||
+    sourceUrl.hash
+  ) {
+    return null;
+  }
+  const segments = sourceUrl.pathname.split("/").filter(Boolean);
+  if (segments.length < 5 || segments[2] !== "tree") {
+    return null;
+  }
+  const repositoryUrl = `https://github.com/${segments[0]}/${segments[1]}`;
+  const verifiedRepository = VERIFIED_REPOSITORIES.get(repositoryUrl.toLowerCase());
+  const revision = segments[3]?.toLowerCase() ?? "";
+  const pathSegments = segments.slice(4);
+  if (
+    !verifiedRepository ||
+    !FULL_GIT_REVISION_PATTERN.test(revision) ||
+    pathSegments.length === 0 ||
+    !pathSegments.every((segment) => SAFE_REPOSITORY_PATH_SEGMENT.test(segment))
+  ) {
+    return null;
+  }
+  if (pathSegments.at(-1) !== "SKILL.md") {
+    pathSegments.push("SKILL.md");
+  }
+  return {
+    provenanceType: "definition",
+    verified: true,
+    provider: "github",
+    status: "verified",
+    url: verifiedRepository,
+    revision,
+    path: pathSegments.join("/"),
+  };
+}
+
+function skillDefinitionRepository(skill: JsonRecord, runtimeRevision: string | null) {
+  return bundledSkillRepository(skill, runtimeRevision) ?? trackedSkillRepository(skill);
+}
+
+function mergeSkillInventory(skills: JsonRecord[]) {
+  const grouped = new Map<string, JsonRecord[]>();
+  for (const skill of skills) {
+    const key = String(skill.key);
+    const observations = grouped.get(key);
+    if (observations) {
+      observations.push(skill);
+    } else {
+      grouped.set(key, [skill]);
+    }
+  }
+  const mergedSkills: JsonRecord[] = [];
+  for (const observations of grouped.values()) {
+    const first = observations[0] ?? {};
+    const origins = new Set(observations.map((skill) => String(skill.origin)));
+    const repositorySignatures = new Set(
+      observations.map((skill) => JSON.stringify(skill.repositories ?? [])),
+    );
+    const statuses = new Set(observations.map((skill) => String(skill.status)));
+    const repositories =
+      origins.size === 1 && repositorySignatures.size === 1
+        ? ((first.repositories as JsonRecord[] | undefined) ?? [])
+        : [];
+    mergedSkills.push({
+      ...first,
+      status: statuses.has("error") ? "error" : statuses.has("disabled") ? "disabled" : "available",
+      origin: origins.size === 1 ? first.origin : "unknown",
+      repositories,
+    });
+  }
+  return mergedSkills;
 }
 
 function safeTimestamp(value: unknown, fallback: number): string {
@@ -227,6 +396,7 @@ async function probeMcpServers(cfg: OpenClawConfig, capturedAt: string) {
 async function buildSnapshot(context: GatewayRequestContext, client: GatewayClient | null) {
   const capturedAtMs = Date.now();
   const capturedAt = new Date(capturedAtMs).toISOString();
+  const runtimeRepository = buildRuntimeRepository();
   const agentsResult = await invokeReadHandler({
     handler: agentsHandlers["agents.list"],
     method: "agents.list",
@@ -260,10 +430,13 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
       if (!key) {
         continue;
       }
+      const definitionRepository = skillDefinitionRepository(skill, runtimeRepository.revision);
       skills.push({
         key,
         name: safeText(skill.name, key),
         status: normalizeSkillState(skill),
+        origin: normalizeSkillOrigin(skill),
+        repositories: definitionRepository ? [definitionRepository] : [],
         checkedAt: capturedAt,
         evidenceCode: "OBS-OPENCLAW-SKILLS-STATUS",
       });
@@ -329,7 +502,7 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
   const uniqueBy = (values: JsonRecord[], key: string) => [
     ...new Map(values.map((value) => [String(value[key]), value])).values(),
   ];
-  const uniqueSkills = uniqueBy(skills, "key").toSorted((a, b) =>
+  const uniqueSkills = mergeSkillInventory(skills).toSorted((a, b) =>
     String(a.key).localeCompare(String(b.key)),
   );
   const uniqueTools = uniqueBy(tools, "key").toSorted((a, b) =>
@@ -351,14 +524,25 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
     activityEvents: activityEvents.length,
   };
   const revision = createHash("sha256")
-    .update(JSON.stringify({ agents, skills: uniqueSkills, tools: uniqueTools, mcp, sourceCounts }))
+    .update(
+      JSON.stringify({
+        agents,
+        skills: uniqueSkills,
+        tools: uniqueTools,
+        mcp,
+        sourceCounts,
+        runtimeRepository,
+      }),
+    )
     .digest("hex");
   return {
     schemaVersion: 1,
+    provenanceVersion: 2,
     complete: true,
     capturedAt,
     revision,
     sourceCounts,
+    runtimeRepository,
     agents,
     skills: uniqueSkills,
     tools: uniqueTools,
@@ -394,4 +578,12 @@ export const observabilityHandlers: GatewayRequestHandlers = {
   },
 };
 
-export const testApi = { buildActivityEvents, normalizeSessionOutcome, normalizeTaskOutcome };
+export const testApi = {
+  buildActivityEvents,
+  buildRuntimeRepository,
+  bundledSkillRepository,
+  mergeSkillInventory,
+  normalizeSessionOutcome,
+  normalizeTaskOutcome,
+  trackedSkillRepository,
+};
