@@ -27,6 +27,134 @@ function responding(payload: unknown): GatewayRequestHandler {
   return ({ respond }) => respond(true, payload, undefined);
 }
 
+describe("observability repository provenance", () => {
+  it("exports only a validated runtime revision for the verified fork", () => {
+    const revision = "a".repeat(40);
+    expect(testApi.buildRuntimeRepository(revision)).toEqual({
+      provenanceType: "runtime",
+      verified: true,
+      provider: "github",
+      status: "verified",
+      url: "https://github.com/AleksandrYusupov/openclaw",
+      revision,
+      path: null,
+    });
+    expect(testApi.buildRuntimeRepository("not-a-revision").revision).toBeNull();
+  });
+
+  it("links only bundled skill definitions with a safe repo-relative path", () => {
+    expect(
+      testApi.bundledSkillRepository(
+        {
+          bundled: true,
+          source: "openclaw-bundled",
+          filePath: "/opt/openclaw/skills/incident-review/SKILL.md",
+        },
+        "a".repeat(40),
+      ),
+    ).toMatchObject({
+      provenanceType: "definition",
+      verified: true,
+      url: "https://github.com/AleksandrYusupov/openclaw",
+      revision: "a".repeat(40),
+      path: "skills/incident-review/SKILL.md",
+    });
+    expect(
+      testApi.bundledSkillRepository(
+        {
+          bundled: false,
+          source: "openclaw-workspace",
+          filePath: "/private/workspace/skills/custom/SKILL.md",
+        },
+        "a".repeat(40),
+      ),
+    ).toBeNull();
+    expect(
+      testApi.bundledSkillRepository(
+        {
+          bundled: true,
+          source: "openclaw-bundled",
+          filePath: "skills/../SKILL.md",
+        },
+        "a".repeat(40),
+      ),
+    ).toBeNull();
+  });
+
+  it("links only valid commit-pinned tracked definitions from the repository allowlist", () => {
+    const revision = "b".repeat(40);
+    expect(
+      testApi.trackedSkillRepository({
+        clawhub: {
+          status: "linked",
+          valid: true,
+          sourceUrl: `https://github.com/AleksandrYusupov/ai-dev-team-2/tree/${revision}/skills/fix-agent`,
+        },
+      }),
+    ).toEqual({
+      provenanceType: "definition",
+      verified: true,
+      provider: "github",
+      status: "verified",
+      url: "https://github.com/AleksandrYusupov/ai-dev-team-2",
+      revision,
+      path: "skills/fix-agent/SKILL.md",
+    });
+    expect(
+      testApi.trackedSkillRepository({
+        clawhub: {
+          status: "linked",
+          valid: true,
+          sourceUrl: `https://github.com/unregistered/private/tree/${revision}/skills/secret`,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      testApi.trackedSkillRepository({
+        clawhub: {
+          status: "linked",
+          valid: true,
+          sourceUrl: "https://github.com/AleksandrYusupov/ai-dev-team-2/tree/main/skills/fix-agent",
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("drops definition provenance when the same skill key has conflicting origins", () => {
+    const repository = {
+      provenanceType: "definition",
+      verified: true,
+      provider: "github",
+      status: "verified",
+      url: "https://github.com/AleksandrYusupov/openclaw",
+      revision: "c".repeat(40),
+      path: "skills/shared/SKILL.md",
+    };
+    const bundled = {
+      key: "shared",
+      name: "Shared",
+      status: "available",
+      origin: "bundled",
+      repositories: [repository],
+    };
+    const workspace = {
+      key: "shared",
+      name: "Shared override",
+      status: "available",
+      origin: "workspace",
+      repositories: [],
+    };
+    for (const observations of [
+      [bundled, workspace],
+      [workspace, bundled],
+    ]) {
+      expect(testApi.mergeSkillInventory(observations)).toEqual([
+        expect.objectContaining({ key: "shared", origin: "unknown", repositories: [] }),
+      ]);
+    }
+  });
+});
+
 describe("observability activity projection", () => {
   it("returns opaque references and no task/session payload text", () => {
     const events = testApi.buildActivityEvents(
@@ -82,7 +210,24 @@ describe("observability activity projection", () => {
       agents: [{ id: "agent-manager", name: "Agent Manager" }],
     });
     skillsHandlers["skills.status"] = responding({
-      skills: [{ key: "incident-review", name: "Incident Review", eligible: true }],
+      skills: [
+        {
+          key: "incident-review",
+          name: "Incident Review",
+          eligible: true,
+          bundled: true,
+          source: "openclaw-bundled",
+          filePath: "/opt/openclaw/skills/incident-review/SKILL.md",
+        },
+        {
+          key: "private-workspace-skill",
+          name: "Private Workspace Skill",
+          eligible: true,
+          bundled: false,
+          source: "openclaw-workspace",
+          filePath: "/private/workspace/skills/private-workspace-skill/SKILL.md",
+        },
+      ],
     });
     toolsCatalogHandlers["tools.catalog"] = responding({
       groups: [{ tools: [{ id: "tasks_list", label: "Tasks list" }] }],
@@ -118,12 +263,34 @@ describe("observability activity projection", () => {
     expect(response?.ok).toBe(true);
     expect(response?.payload).toMatchObject({
       complete: true,
-      sourceCounts: { agents: 1, skills: 1, tools: 1, mcp: 0, activityEvents: 1 },
+      provenanceVersion: 2,
+      sourceCounts: { agents: 1, skills: 2, tools: 1, mcp: 0, activityEvents: 1 },
       agents: [{ id: "agent-manager", status: "available" }],
-      skills: [{ key: "incident-review", status: "available" }],
+      skills: [
+        {
+          key: "incident-review",
+          status: "available",
+          origin: "bundled",
+          repositories: [
+            {
+              provenanceType: "definition",
+              verified: true,
+              url: "https://github.com/AleksandrYusupov/openclaw",
+              path: "skills/incident-review/SKILL.md",
+            },
+          ],
+        },
+        {
+          key: "private-workspace-skill",
+          status: "available",
+          origin: "workspace",
+          repositories: [],
+        },
+      ],
       activityCoverage: [{ agentId: "agent-manager", eventCount: 1, complete: true }],
     });
     expect(JSON.stringify(response?.payload)).not.toContain("private-task-id");
     expect(JSON.stringify(response?.payload)).not.toContain("private-session-id");
+    expect(JSON.stringify(response?.payload)).not.toContain("/private/workspace");
   });
 });
