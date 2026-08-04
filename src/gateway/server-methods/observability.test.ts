@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  getDiagnosticSessionState,
+  resetDiagnosticSessionStateForTest,
+} from "../../logging/diagnostic-session-state.js";
 import { agentsHandlers } from "./agents.js";
 import { observabilityHandlers, testApi } from "./observability.js";
 import { sessionsHandlers } from "./sessions.js";
@@ -21,6 +25,7 @@ afterEach(() => {
   tasksHandlers["tasks.list"] = originalHandlers.tasks;
   sessionsHandlers["sessions.list"] = originalHandlers.sessions;
   toolsCatalogHandlers["tools.catalog"] = originalHandlers.tools;
+  resetDiagnosticSessionStateForTest();
 });
 
 function responding(payload: unknown): GatewayRequestHandler {
@@ -203,6 +208,69 @@ describe("observability activity projection", () => {
     expect(serialized).not.toContain("secret prompt");
     expect(serialized).not.toContain("secret stack trace");
     expect(serialized).not.toContain("secret message");
+  });
+
+  it("attributes bounded runtime tool and skill evidence to MCP and skill inventory", () => {
+    const state = getDiagnosticSessionState({ sessionKey: "raw-runtime-session" });
+    state.toolCallHistory = [
+      {
+        toolName: "safe-server__run",
+        argsHash: "private-args-hash",
+        resultHash: "error:private-result-hash",
+        timestamp: 1_800_000_001_000,
+      },
+    ];
+
+    const events = testApi.buildActivityEvents(
+      { tasks: [] },
+      {
+        sessions: [
+          {
+            key: "raw-runtime-session",
+            agentId: "agent-manager",
+            status: "active",
+            updatedAt: 1_800_000_001_000,
+          },
+        ],
+      },
+      1_800_000_002_000,
+      {
+        mcpKeyByToolPrefix: new Map([["safe-server__", "safe-server"]]),
+        skillKeyByName: new Map([["incident review", "incident-review"]]),
+        skillUsage: [
+          {
+            agentId: "agent-manager",
+            runId: "private-run-id",
+            sessionKey: "raw-runtime-session",
+            skillName: "Incident Review",
+            ts: 1_800_000_001_500,
+            seq: 7,
+          },
+        ],
+      },
+    );
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventKind: "tool",
+          mcpId: "safe-server",
+          outcome: "error",
+          evidenceCode: "OBS-OPENCLAW-TOOL-OUTCOME",
+        }),
+        expect.objectContaining({
+          eventKind: "skill",
+          skillIds: ["incident-review"],
+          outcome: "success",
+          evidenceCode: "OBS-OPENCLAW-SKILL-USED",
+        }),
+      ]),
+    );
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("raw-runtime-session");
+    expect(serialized).not.toContain("private-run-id");
+    expect(serialized).not.toContain("private-args-hash");
+    expect(serialized).not.toContain("private-result-hash");
   });
 
   it("assembles a complete read-only snapshot from existing gateway read models", async () => {
