@@ -5,13 +5,13 @@ import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/i
 import { TOOL_NAME_SEPARATOR } from "../../agents/agent-bundle-mcp-names.js";
 import { createSessionMcpRuntime } from "../../agents/agent-bundle-mcp-runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  onTrustedInternalDiagnosticEvent,
-  type DiagnosticSkillUsedEvent,
-} from "../../infra/diagnostic-events.js";
 import { resolveCommitHash } from "../../infra/git-commit.js";
 import { peekDiagnosticSessionState } from "../../logging/diagnostic-session-state.js";
 import { agentsHandlers } from "./agents.js";
+import {
+  getObservedSkillUsage,
+  type ObservedSkillUsage,
+} from "./observability-runtime-activity.js";
 import { sessionsHandlers } from "./sessions.js";
 import { skillsHandlers } from "./skills.js";
 import { tasksHandlers } from "./tasks.js";
@@ -24,7 +24,6 @@ import type {
 } from "./types.js";
 
 const MAX_ACTIVITY_EVENTS = 1_000;
-const MAX_SKILL_ACTIVITY_EVENTS = 1_000;
 const MCP_PROBE_TIMEOUT_MS = 5_000;
 const OPENCLAW_RUNTIME_REPOSITORY = "https://github.com/AleksandrYusupov/openclaw";
 const OPENCLAW_UPSTREAM_REPOSITORY = "https://github.com/openclaw/openclaw";
@@ -35,33 +34,6 @@ const FULL_GIT_REVISION_PATTERN = /^[a-f0-9]{40}$/iu;
 const SAFE_REPOSITORY_PATH_SEGMENT = /^[a-z0-9][a-z0-9._-]*$/iu;
 
 type JsonRecord = Record<string, unknown>;
-
-type ObservedSkillUsage = Pick<
-  DiagnosticSkillUsedEvent,
-  "agentId" | "runId" | "sessionId" | "sessionKey" | "skillName" | "ts" | "seq"
->;
-
-const observedSkillUsage: ObservedSkillUsage[] = [];
-
-// This module is loaded with the Gateway method registry. Keep only bounded,
-// path-free runtime facts so observability snapshots never inspect prompts or transcripts.
-onTrustedInternalDiagnosticEvent((event, metadata) => {
-  if (!metadata.trusted || event.type !== "skill.used" || !event.agentId) {
-    return;
-  }
-  observedSkillUsage.push({
-    agentId: event.agentId,
-    runId: event.runId,
-    sessionId: event.sessionId,
-    sessionKey: event.sessionKey,
-    skillName: event.skillName,
-    ts: event.ts,
-    seq: event.seq,
-  });
-  if (observedSkillUsage.length > MAX_SKILL_ACTIVITY_EVENTS) {
-    observedSkillUsage.splice(0, observedSkillUsage.length - MAX_SKILL_ACTIVITY_EVENTS);
-  }
-});
 
 function records(value: unknown, key: string): JsonRecord[] {
   const source = asRecord(value)?.[key];
@@ -436,7 +408,7 @@ function buildActivityEvents(
       });
     }
   }
-  for (const usage of attribution.skillUsage ?? observedSkillUsage) {
+  for (const usage of attribution.skillUsage ?? getObservedSkillUsage()) {
     const agentId = safeText(usage.agentId, "", 200);
     const skillKey = attribution.skillKeyByName?.get(usage.skillName.toLowerCase());
     if (!agentId || !skillKey) {
@@ -735,4 +707,3 @@ export const testApi = {
   normalizeTaskOutcome,
   trackedSkillRepository,
 };
-/* oxlint-disable max-lines -- Keep snapshot collection in one auditable privacy boundary. */
