@@ -347,6 +347,31 @@ export function readAgentDeletionJournal(
   return entry;
 }
 
+export function listCompletedAgentDeletionTombstones(
+  options: OpenClawStateDatabaseOptions = {},
+): Array<{ agentId: string; deletedAt: number }> {
+  const databasePath = path.resolve(
+    options.path ?? resolveOpenClawStateSqlitePath(options.env ?? process.env),
+  );
+  if (!existsSync(databasePath)) {
+    return [];
+  }
+  let tombstones: Array<{ agentId: string; deletedAt: number }> = [];
+  runOpenClawStateWriteTransaction((database) => {
+    ensureAgentDeletionJournalSchema(database.db);
+    const db = getNodeSqliteKysely<AgentDeletionDatabase>(database.db);
+    tombstones = executeSqliteQuerySync(
+      database.db,
+      db
+        .selectFrom("agent_deletion_journal")
+        .select(["agent_id", "created_at"])
+        .where("cleanup_completed", "=", 1)
+        .orderBy("agent_id", "asc"),
+    ).rows.map((row) => ({ agentId: row.agent_id, deletedAt: row.created_at }));
+  }, options);
+  return tombstones;
+}
+
 export function beginAgentDeletionJournal(
   entry: Omit<
     AgentDeletionJournalEntry,
