@@ -2,13 +2,15 @@
 import { createHash } from "node:crypto";
 import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
-import { TOOL_NAME_SEPARATOR } from "../../agents/agent-bundle-mcp-names.js";
-import { createSessionMcpRuntime } from "../../agents/agent-bundle-mcp-runtime.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveCommitHash } from "../../infra/git-commit.js";
 import { peekDiagnosticSessionState } from "../../logging/diagnostic-session-state.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
+import { listCompletedAgentDeletionTombstones } from "../../state/agent-deletion-journal.js";
 import { agentsHandlers } from "./agents.js";
+import {
+  normalizeObservabilityMcpReasonCode,
+  probeObservabilityMcpServers,
+} from "./observability-mcp.js";
 import {
   getObservedSkillUsage,
   type ObservedSkillUsage,
@@ -25,7 +27,6 @@ import type {
 } from "./types.js";
 
 const MAX_ACTIVITY_EVENTS = 1_000;
-const MCP_PROBE_TIMEOUT_MS = 5_000;
 const OPENCLAW_RUNTIME_REPOSITORY = "https://github.com/AleksandrYusupov/openclaw";
 const OPENCLAW_UPSTREAM_REPOSITORY = "https://github.com/openclaw/openclaw";
 const AI_DEV_TEAM_REPOSITORY = "https://github.com/AleksandrYusupov/ai-dev-team-2";
@@ -35,6 +36,7 @@ const FULL_GIT_REVISION_PATTERN = /^[a-f0-9]{40}$/iu;
 const SAFE_REPOSITORY_PATH_SEGMENT = /^[a-z0-9][a-z0-9._-]*$/iu;
 
 type JsonRecord = Record<string, unknown>;
+type ObservabilityAgentRoleClass = "user" | "system" | "test" | "unlisted";
 
 function records(value: unknown, key: string): JsonRecord[] {
   const source = asRecord(value)?.[key];
@@ -46,15 +48,6 @@ function records(value: unknown, key: string): JsonRecord[] {
 function safeText(value: unknown, fallback: string, maxLength = 160): string {
   const text = typeof value === "string" ? value.trim() : "";
   return (text || fallback).slice(0, maxLength);
-}
-
-function safeStringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value
-        .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim())
-        .filter(Boolean)
-    : [];
 }
 
 function buildRuntimeRepository(revision = resolveCommitHash({ moduleUrl: import.meta.url })) {
@@ -295,6 +288,14 @@ function normalizeSessionOutcome(status: string): "success" | "error" | "running
   return "running";
 }
 
+function normalizeAgentRoleClass(agent: JsonRecord): ObservabilityAgentRoleClass {
+  const roleClass = safeText(agent.roleClass, "", 40).toLowerCase();
+  if (["user", "system", "test", "unlisted"].includes(roleClass)) {
+    return roleClass as ObservabilityAgentRoleClass;
+  }
+  return agent.kind === "system" ? "system" : "user";
+}
+
 type RuntimeActivityAttribution = {
   mcpKeyByToolPrefix?: ReadonlyMap<string, string>;
   skillKeyByName?: ReadonlyMap<string, string>;
@@ -449,56 +450,6 @@ function buildActivityEvents(
     .slice(0, MAX_ACTIVITY_EVENTS);
 }
 
-async function probeMcpServers(cfg: OpenClawConfig, capturedAt: string) {
-  const configured = asRecord(cfg.mcp?.servers) ?? {};
-  const enabledServers = Object.fromEntries(
-    Object.entries(configured)
-      .filter(([, value]) => asRecord(value)?.enabled !== false)
-      .map(([name, value]) => [
-        name,
-        { ...asRecord(value), connectionTimeoutMs: MCP_PROBE_TIMEOUT_MS },
-      ]),
-  );
-  let catalog: Awaited<
-    ReturnType<ReturnType<typeof createSessionMcpRuntime>["getCatalog"]>
-  > | null = null;
-  if (Object.keys(enabledServers).length > 0) {
-    const runtime = createSessionMcpRuntime({
-      sessionId: "openclaw-observability-probe",
-      workspaceDir: process.cwd(),
-      cfg: { ...cfg, mcp: { ...cfg.mcp, servers: enabledServers } },
-      manifestRegistry: { plugins: [] },
-    });
-    try {
-      catalog = await runtime.getCatalog();
-    } finally {
-      await runtime.dispose();
-    }
-  }
-  const failed = new Set((catalog?.diagnostics ?? []).map((item) => item.serverName));
-  const servers = Object.entries(configured)
-    .map(([key, value]) => {
-      const server = asRecord(value) ?? {};
-      const disabled = server.enabled === false;
-      const connected = Boolean(catalog?.servers[key]);
-      const codex = asRecord(server.codex);
-      return {
-        key,
-        name: safeText(server.name, key),
-        status: disabled ? "disabled" : connected && !failed.has(key) ? "healthy" : "degraded",
-        checkedAt: capturedAt,
-        evidenceCode: disabled ? "OBS-OPENCLAW-MCP-DISABLED" : "OBS-OPENCLAW-MCP-PROBE",
-        agentIds: safeStringArray(server.agentIds ?? server.agents ?? codex?.agents),
-      };
-    })
-    .toSorted((left, right) => left.key.localeCompare(right.key));
-  const mcpKeyByToolPrefix = new Map<string, string>();
-  for (const tool of catalog?.tools ?? []) {
-    mcpKeyByToolPrefix.set(`${tool.safeServerName}${TOOL_NAME_SEPARATOR}`, tool.serverName);
-  }
-  return { servers, mcpKeyByToolPrefix };
-}
-
 async function buildSnapshot(context: GatewayRequestContext, client: GatewayClient | null) {
   const capturedAtMs = Date.now();
   const capturedAt = new Date(capturedAtMs).toISOString();
@@ -510,15 +461,29 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
     client,
   });
   const agents = records(agentsResult, "agents")
-    .map((agent) => ({
-      id: safeText(agent.id ?? agent.agentId, "", 200),
-      name: safeText(agent.name ?? agent.displayName, safeText(agent.id, "agent", 200)),
-      status: agent.enabled === false ? "disabled" : "available",
-      checkedAt: capturedAt,
-      evidenceCode: "OBS-OPENCLAW-AGENTS-LIST",
-    }))
+    .map((agent) => {
+      const disabled = agent.enabled === false;
+      return {
+        id: safeText(agent.id ?? agent.agentId, "", 200),
+        name: safeText(agent.name ?? agent.displayName, safeText(agent.id, "agent", 200)),
+        status: disabled ? "disabled" : "available",
+        lifecycleState: "current",
+        accessState: disabled ? "disabled" : "available",
+        roleClass: normalizeAgentRoleClass(agent),
+        checkedAt: capturedAt,
+        evidenceCode: "OBS-OPENCLAW-AGENTS-LIST",
+      };
+    })
     .filter((agent) => agent.id)
     .toSorted((left, right) => left.id.localeCompare(right.id));
+  const agentTombstones = listCompletedAgentDeletionTombstones().map((entry) => ({
+    id: entry.agentId,
+    lifecycleState: "removed",
+    accessState: "disabled",
+    roleClass: "unlisted",
+    removedAt: safeTimestamp(entry.deletedAt, capturedAtMs),
+    evidenceCode: "OBS-OPENCLAW-AGENT-DELETION",
+  }));
 
   const skills: JsonRecord[] = [];
   const tools: JsonRecord[] = [];
@@ -537,16 +502,19 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
         continue;
       }
       const definitionRepository = skillDefinitionRepository(skill, runtimeRepository.revision);
+      const skillState = normalizeSkillState(skill);
       skills.push({
         key,
         name: safeText(skill.name, key),
-        status: normalizeSkillState(skill),
+        status: skillState,
+        lifecycleState: "current",
+        accessState: skillState === "disabled" ? "disabled" : "available",
         origin: normalizeSkillOrigin(skill),
         repositories: definitionRepository ? [definitionRepository] : [],
         checkedAt: capturedAt,
         evidenceCode: "OBS-OPENCLAW-SKILLS-STATUS",
       });
-      if (skill.eligible === true && normalizeSkillState(skill) === "available") {
+      if (skill.eligible === true && skillState === "available") {
         relations.push({ source: agent.id, target: key, kind: "loads_skill" });
       }
     }
@@ -563,7 +531,13 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
         if (!key) {
           continue;
         }
-        tools.push({ key, name: safeText(tool.label ?? tool.name, key), status: "available" });
+        tools.push({
+          key,
+          name: safeText(tool.label ?? tool.name, key),
+          status: "available",
+          lifecycleState: "current",
+          accessState: "available",
+        });
         relations.push({ source: agent.id, target: key, kind: "has_tool" });
       }
     }
@@ -583,7 +557,7 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
     context,
     client,
   });
-  const { servers: mcpWithScopes, mcpKeyByToolPrefix } = await probeMcpServers(
+  const { servers: mcpWithScopes, mcpKeyByToolPrefix } = await probeObservabilityMcpServers(
     context.getRuntimeConfig(),
     capturedAt,
   );
@@ -648,6 +622,7 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
   });
   const sourceCounts = {
     agents: agents.length,
+    agentTombstones: agentTombstones.length,
     skills: uniqueSkills.length,
     tools: uniqueTools.length,
     mcp: mcp.length,
@@ -657,6 +632,7 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
     .update(
       JSON.stringify({
         agents,
+        agentTombstones,
         skills: uniqueSkills,
         tools: uniqueTools,
         mcp,
@@ -674,6 +650,7 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
     sourceCounts,
     runtimeRepository,
     agents,
+    agentTombstones,
     skills: uniqueSkills,
     tools: uniqueTools,
     mcp,
@@ -713,6 +690,8 @@ export const testApi = {
   buildRuntimeRepository,
   bundledSkillRepository,
   mergeSkillInventory,
+  normalizeAgentRoleClass,
+  normalizeMcpReasonCode: normalizeObservabilityMcpReasonCode,
   normalizeSessionOutcome,
   normalizeTaskOutcome,
   trackedSkillRepository,

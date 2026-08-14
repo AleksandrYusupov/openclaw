@@ -380,8 +380,24 @@ describe("observability activity projection", () => {
     expect(response?.payload).toMatchObject({
       complete: true,
       provenanceVersion: 2,
-      sourceCounts: { agents: 1, skills: 2, tools: 1, mcp: 0, activityEvents: 1 },
-      agents: [{ id: "agent-manager", status: "available" }],
+      sourceCounts: {
+        agents: 1,
+        agentTombstones: 0,
+        skills: 2,
+        tools: 1,
+        mcp: 0,
+        activityEvents: 1,
+      },
+      agents: [
+        {
+          id: "agent-manager",
+          status: "available",
+          lifecycleState: "current",
+          accessState: "available",
+          roleClass: "user",
+        },
+      ],
+      agentTombstones: [],
       skills: [
         {
           key: "incident-review",
@@ -408,5 +424,26 @@ describe("observability activity projection", () => {
     expect(JSON.stringify(response?.payload)).not.toContain("private-task-id");
     expect(JSON.stringify(response?.payload)).not.toContain("private-session-id");
     expect(JSON.stringify(response?.payload)).not.toContain("/private/workspace");
+  });
+});
+
+describe("observability inventory metadata", () => {
+  it.each([
+    { input: { roleClass: "test" }, expected: "test" },
+    { input: { roleClass: "unlisted" }, expected: "unlisted" },
+    { input: { kind: "system" }, expected: "system" },
+    { input: {}, expected: "user" },
+    { input: { roleClass: "invented" }, expected: "user" },
+  ])("normalizes explicit agent role metadata to $expected", ({ input, expected }) => {
+    expect(testApi.normalizeAgentRoleClass(input)).toBe(expected);
+  });
+
+  it.each([
+    { message: "request timed out", expected: "timeout" },
+    { message: "tools/list failed", expected: "catalog_failed" },
+    { message: "transport closed", expected: "connection_failed" },
+    { message: "redacted diagnostic", expected: "runtime_diagnostic" },
+  ])("maps MCP diagnostics to safe reason $expected", ({ message, expected }) => {
+    expect(testApi.normalizeMcpReasonCode(message)).toBe(expected);
   });
 });

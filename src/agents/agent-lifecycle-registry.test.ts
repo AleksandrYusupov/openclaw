@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   claimCompletedAgentDeletionJournal,
+  listCompletedAgentDeletionTombstones,
   readAgentDeletionJournal,
 } from "../state/agent-deletion-journal.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
@@ -63,6 +64,22 @@ describe("agent lifecycle registry", () => {
     ).toBe(true);
     expect(readAgentDeletionJournal("recreated-agent", options)).toBeUndefined();
     expect(isAgentDeletionBlocked("recreated-agent", options)).toBe(false);
+  });
+
+  it("lists only completed deletion tombstones without cleanup details", () => {
+    const options = createOptions();
+    const completed = beginAgentDeletion(createEntry("completed-agent"), options);
+    const pending = beginAgentDeletion(createEntry("pending-agent"), options);
+    completed.commit();
+    completed.finish();
+    pending.commit();
+
+    expect(listCompletedAgentDeletionTombstones(options)).toEqual([
+      {
+        agentId: "completed-agent",
+        deletedAt: completed.entry.createdAt,
+      },
+    ]);
   });
 
   it("releases the durable fence when deletion rolls back before roster commit", () => {
