@@ -5,7 +5,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 
 const MCP_PROBE_TIMEOUT_MS = 5_000;
 
-export type ObservabilityMcpReasonCode =
+type ObservabilityMcpReasonCode =
   | "disabled"
   | "timeout"
   | "connection_failed"
