@@ -7,6 +7,7 @@ import { createSessionMcpRuntime } from "../../agents/agent-bundle-mcp-runtime.j
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveCommitHash } from "../../infra/git-commit.js";
 import { peekDiagnosticSessionState } from "../../logging/diagnostic-session-state.js";
+import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { agentsHandlers } from "./agents.js";
 import {
   getObservedSkillUsage,
@@ -285,10 +286,10 @@ function normalizeTaskOutcome(status: string): "success" | "error" | "running" {
 }
 
 function normalizeSessionOutcome(status: string): "success" | "error" | "running" {
-  if (status === "failed" || status === "error" || status === "timed_out") {
+  if (["failed", "error", "timed_out", "killed", "cancelled", "aborted"].includes(status)) {
     return "error";
   }
-  if (status === "completed" || status === "closed" || status === "archived") {
+  if (["completed", "closed", "archived", "done"].includes(status)) {
     return "success";
   }
   return "running";
@@ -349,7 +350,13 @@ function buildActivityEvents(
   }
   for (const session of records(sessionsResult, "sessions")) {
     const sessionKey = safeText(session.key ?? session.sessionKey ?? session.id, "", 500);
-    const agentId = safeText(session.agentId ?? asRecord(session.agentRuntime)?.agentId, "", 200);
+    const agentId = safeText(
+      session.agentId ??
+        asRecord(session.agentRuntime)?.agentId ??
+        parseAgentSessionKey(sessionKey)?.agentId,
+      "",
+      200,
+    );
     if (!sessionKey || !agentId) {
       continue;
     }
@@ -359,7 +366,10 @@ function buildActivityEvents(
       eventId: `openclaw:event:${opaque("openclaw-observability-session-v1", sessionKey)}`,
       eventKind: "session",
       agentId,
-      occurredAt: safeTimestamp(session.updatedAt ?? session.createdAt, capturedAtMs),
+      occurredAt: safeTimestamp(
+        session.endedAt ?? session.updatedAt ?? session.startedAt ?? session.createdAt,
+        capturedAtMs,
+      ),
       trigger: "session",
       outcome,
       chatReference: opaque("openclaw-observability-chat-v1", sessionKey),
