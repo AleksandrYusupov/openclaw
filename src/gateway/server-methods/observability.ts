@@ -2,10 +2,16 @@
 import { createHash } from "node:crypto";
 import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
+import { TOOL_NAME_SEPARATOR } from "../../agents/agent-bundle-mcp-names.js";
 import { createSessionMcpRuntime } from "../../agents/agent-bundle-mcp-runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveCommitHash } from "../../infra/git-commit.js";
+import { peekDiagnosticSessionState } from "../../logging/diagnostic-session-state.js";
 import { agentsHandlers } from "./agents.js";
+import {
+  getObservedSkillUsage,
+  type ObservedSkillUsage,
+} from "./observability-runtime-activity.js";
 import { sessionsHandlers } from "./sessions.js";
 import { skillsHandlers } from "./skills.js";
 import { tasksHandlers } from "./tasks.js";
@@ -288,7 +294,30 @@ function normalizeSessionOutcome(status: string): "success" | "error" | "running
   return "running";
 }
 
-function buildActivityEvents(tasksResult: unknown, sessionsResult: unknown, capturedAtMs: number) {
+type RuntimeActivityAttribution = {
+  mcpKeyByToolPrefix?: ReadonlyMap<string, string>;
+  skillKeyByName?: ReadonlyMap<string, string>;
+  skillUsage?: readonly ObservedSkillUsage[];
+};
+
+function matchedMcpKey(
+  toolName: string,
+  mcpKeyByToolPrefix: ReadonlyMap<string, string> | undefined,
+): string | undefined {
+  for (const [prefix, mcpKey] of mcpKeyByToolPrefix ?? []) {
+    if (toolName.startsWith(prefix)) {
+      return mcpKey;
+    }
+  }
+  return undefined;
+}
+
+function buildActivityEvents(
+  tasksResult: unknown,
+  sessionsResult: unknown,
+  capturedAtMs: number,
+  attribution: RuntimeActivityAttribution = {},
+) {
   const events: JsonRecord[] = [];
   for (const task of records(tasksResult, "tasks")) {
     const taskId = safeText(task.taskId ?? task.id, "", 500);
@@ -342,6 +371,68 @@ function buildActivityEvents(tasksResult: unknown, sessionsResult: unknown, capt
           }
         : {}),
     });
+
+    const sessionState = peekDiagnosticSessionState({ sessionKey });
+    for (const call of sessionState?.toolCallHistory ?? []) {
+      const toolOutcome =
+        call.outcomeKind === "tool-loop-veto" || call.resultHash?.startsWith("error:")
+          ? "error"
+          : call.resultHash
+            ? "success"
+            : "running";
+      const mcpId = matchedMcpKey(call.toolName, attribution.mcpKeyByToolPrefix);
+      const toolEvidenceId = [
+        sessionKey,
+        call.runId ?? "",
+        call.toolCallId ?? "",
+        call.toolName,
+        String(call.timestamp),
+        call.argsHash,
+      ].join("\0");
+      events.push({
+        eventId: `openclaw:event:${opaque("openclaw-observability-tool-v1", toolEvidenceId)}`,
+        eventKind: "tool",
+        agentId,
+        occurredAt: safeTimestamp(call.timestamp, capturedAtMs),
+        trigger: "tool",
+        outcome: toolOutcome,
+        chatReference: opaque("openclaw-observability-chat-v1", sessionKey),
+        evidenceCode: "OBS-OPENCLAW-TOOL-OUTCOME",
+        ...(mcpId ? { mcpId } : {}),
+        ...(toolOutcome === "error"
+          ? {
+              errorCode: "OPENCLAW_TOOL_ERROR",
+              errorTitle: "OpenClaw tool execution failed",
+            }
+          : {}),
+      });
+    }
+  }
+  for (const usage of attribution.skillUsage ?? getObservedSkillUsage()) {
+    const agentId = safeText(usage.agentId, "", 200);
+    const skillKey = attribution.skillKeyByName?.get(usage.skillName.toLowerCase());
+    if (!agentId || !skillKey) {
+      continue;
+    }
+    const sessionReference = usage.sessionKey ?? usage.sessionId ?? usage.runId;
+    const skillEvidenceId = [
+      agentId,
+      usage.runId ?? "",
+      usage.skillName,
+      String(usage.ts),
+      String(usage.seq),
+    ].join("\0");
+    events.push({
+      eventId: `openclaw:event:${opaque("openclaw-observability-skill-v1", skillEvidenceId)}`,
+      eventKind: "skill",
+      agentId,
+      occurredAt: safeTimestamp(usage.ts, capturedAtMs),
+      trigger: "skill",
+      outcome: "success",
+      chatReference: opaque("openclaw-observability-chat-v1", sessionReference ?? skillEvidenceId),
+      skillIds: [skillKey],
+      evidenceCode: "OBS-OPENCLAW-SKILL-USED",
+    });
   }
   return events
     .toSorted((left, right) => String(right.occurredAt).localeCompare(String(left.occurredAt)))
@@ -375,7 +466,7 @@ async function probeMcpServers(cfg: OpenClawConfig, capturedAt: string) {
     }
   }
   const failed = new Set((catalog?.diagnostics ?? []).map((item) => item.serverName));
-  return Object.entries(configured)
+  const servers = Object.entries(configured)
     .map(([key, value]) => {
       const server = asRecord(value) ?? {};
       const disabled = server.enabled === false;
@@ -391,6 +482,11 @@ async function probeMcpServers(cfg: OpenClawConfig, capturedAt: string) {
       };
     })
     .toSorted((left, right) => left.key.localeCompare(right.key));
+  const mcpKeyByToolPrefix = new Map<string, string>();
+  for (const tool of catalog?.tools ?? []) {
+    mcpKeyByToolPrefix.set(`${tool.safeServerName}${TOOL_NAME_SEPARATOR}`, tool.serverName);
+  }
+  return { servers, mcpKeyByToolPrefix };
 }
 
 async function buildSnapshot(context: GatewayRequestContext, client: GatewayClient | null) {
@@ -477,19 +573,10 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
     context,
     client,
   });
-  const activityEvents = buildActivityEvents(tasksResult, sessionsResult, capturedAtMs);
-  const coverage = agents.map((agent) => {
-    const events = activityEvents.filter((event) => event.agentId === agent.id);
-    return {
-      agentId: agent.id,
-      eventCount: events.length,
-      lastEventAt: events[0]?.occurredAt ?? null,
-      capturedAt,
-      complete: true,
-      evidenceCode: "OBS-OPENCLAW-ACTIVITY-COVERAGE",
-    };
-  });
-  const mcpWithScopes = await probeMcpServers(context.getRuntimeConfig(), capturedAt);
+  const { servers: mcpWithScopes, mcpKeyByToolPrefix } = await probeMcpServers(
+    context.getRuntimeConfig(),
+    capturedAt,
+  );
   for (const server of mcpWithScopes) {
     for (const agentId of server.agentIds) {
       if (agents.some((agent) => agent.id === agentId)) {
@@ -516,6 +603,39 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
       ]),
     ).values(),
   ].toSorted((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const skillKeyByName = new Map<string, string>();
+  const ambiguousSkillNames = new Set<string>();
+  for (const skill of uniqueSkills) {
+    const key = safeText(skill.key, "", 240);
+    for (const candidate of [skill.key, skill.name]) {
+      const normalized = safeText(candidate, "", 240).toLowerCase();
+      if (!normalized || ambiguousSkillNames.has(normalized)) {
+        continue;
+      }
+      const existing = skillKeyByName.get(normalized);
+      if (existing && existing !== key) {
+        skillKeyByName.delete(normalized);
+        ambiguousSkillNames.add(normalized);
+      } else {
+        skillKeyByName.set(normalized, key);
+      }
+    }
+  }
+  const activityEvents = buildActivityEvents(tasksResult, sessionsResult, capturedAtMs, {
+    mcpKeyByToolPrefix,
+    skillKeyByName,
+  });
+  const coverage = agents.map((agent) => {
+    const events = activityEvents.filter((event) => event.agentId === agent.id);
+    return {
+      agentId: agent.id,
+      eventCount: events.length,
+      lastEventAt: events[0]?.occurredAt ?? null,
+      capturedAt,
+      complete: activityEvents.length < MAX_ACTIVITY_EVENTS,
+      evidenceCode: "OBS-OPENCLAW-ACTIVITY-COVERAGE",
+    };
+  });
   const sourceCounts = {
     agents: agents.length,
     skills: uniqueSkills.length,
