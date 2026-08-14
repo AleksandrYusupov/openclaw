@@ -179,8 +179,7 @@ describe("observability activity projection", () => {
       {
         sessions: [
           {
-            key: "raw-session-key-2",
-            agentId: "researcher",
+            key: "agent:researcher:raw-session-key-2",
             status: "active",
             updatedAt: 1_800_000_001_000,
             messages: ["secret message"],
@@ -208,6 +207,55 @@ describe("observability activity projection", () => {
     expect(serialized).not.toContain("secret prompt");
     expect(serialized).not.toContain("secret stack trace");
     expect(serialized).not.toContain("secret message");
+  });
+
+  it("attributes durable sessions from canonical keys when sessions.list omits agentId", () => {
+    const events = testApi.buildActivityEvents(
+      { tasks: [] },
+      {
+        sessions: [
+          {
+            key: "agent:agent-manager:telegram:group:private-chat",
+            status: "done",
+            startedAt: 1_800_000_000_000,
+            updatedAt: 1_800_000_001_000,
+            endedAt: 1_800_000_002_000,
+          },
+          {
+            key: "agent:agent-manager:subagent:private-run",
+            status: "killed",
+            updatedAt: 1_800_000_003_000,
+          },
+          {
+            key: "unscoped-private-session",
+            status: "done",
+            updatedAt: 1_800_000_004_000,
+          },
+        ],
+      },
+      1_800_000_005_000,
+    );
+
+    expect(events).toHaveLength(2);
+    expect(events).toMatchObject([
+      {
+        eventKind: "session",
+        agentId: "agent-manager",
+        occurredAt: "2027-01-15T08:00:03.000Z",
+        outcome: "error",
+        errorCode: "OPENCLAW_SESSION_KILLED",
+      },
+      {
+        eventKind: "session",
+        agentId: "agent-manager",
+        occurredAt: "2027-01-15T08:00:02.000Z",
+        outcome: "success",
+      },
+    ]);
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("private-chat");
+    expect(serialized).not.toContain("private-run");
+    expect(serialized).not.toContain("unscoped-private-session");
   });
 
   it("attributes bounded runtime tool and skill evidence to MCP and skill inventory", () => {
