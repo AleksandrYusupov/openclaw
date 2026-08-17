@@ -37,6 +37,16 @@ const SAFE_REPOSITORY_PATH_SEGMENT = /^[a-z0-9][a-z0-9._-]*$/iu;
 
 type JsonRecord = Record<string, unknown>;
 type ObservabilityAgentRoleClass = "user" | "system" | "test" | "unlisted";
+type ObservabilityAgentRoleClassSource = "runtime-explicit" | "stable-id" | "default-unlisted";
+
+const AGENT_ROLE_CLASS_BY_STABLE_ID = new Map<string, ObservabilityAgentRoleClass>([
+  ["agent-manager", "user"],
+  ["kb-archivist", "system"],
+  ["main", "system"],
+  ["onyx-assistant", "system"],
+  ["onyx-text-social-media-post-generator", "unlisted"],
+  ["painta-kb-weekly-maintenance", "system"],
+]);
 
 function records(value: unknown, key: string): JsonRecord[] {
   const source = asRecord(value)?.[key];
@@ -288,12 +298,26 @@ function normalizeSessionOutcome(status: string): "success" | "error" | "running
   return "running";
 }
 
-function normalizeAgentRoleClass(agent: JsonRecord): ObservabilityAgentRoleClass {
+function classifyAgentRole(agent: JsonRecord): {
+  roleClass: ObservabilityAgentRoleClass;
+  roleClassSource: ObservabilityAgentRoleClassSource;
+} {
   const roleClass = safeText(agent.roleClass, "", 40).toLowerCase();
   if (["user", "system", "test", "unlisted"].includes(roleClass)) {
-    return roleClass as ObservabilityAgentRoleClass;
+    return {
+      roleClass: roleClass as ObservabilityAgentRoleClass,
+      roleClassSource: "runtime-explicit",
+    };
   }
-  return agent.kind === "system" ? "system" : "user";
+  const agentId = safeText(agent.id ?? agent.agentId, "", 200).toLowerCase();
+  const stableRole = AGENT_ROLE_CLASS_BY_STABLE_ID.get(agentId);
+  if (stableRole) {
+    return { roleClass: stableRole, roleClassSource: "stable-id" };
+  }
+  if (agentId.startsWith("onyx-")) {
+    return { roleClass: "user", roleClassSource: "stable-id" };
+  }
+  return { roleClass: "unlisted", roleClassSource: "default-unlisted" };
 }
 
 type RuntimeActivityAttribution = {
@@ -463,13 +487,15 @@ async function buildSnapshot(context: GatewayRequestContext, client: GatewayClie
   const agents = records(agentsResult, "agents")
     .map((agent) => {
       const disabled = agent.enabled === false;
+      const role = classifyAgentRole(agent);
       return {
         id: safeText(agent.id ?? agent.agentId, "", 200),
         name: safeText(agent.name ?? agent.displayName, safeText(agent.id, "agent", 200)),
         status: disabled ? "disabled" : "available",
         lifecycleState: "current",
         accessState: disabled ? "disabled" : "available",
-        roleClass: normalizeAgentRoleClass(agent),
+        roleClass: role.roleClass,
+        roleClassSource: role.roleClassSource,
         checkedAt: capturedAt,
         evidenceCode: "OBS-OPENCLAW-AGENTS-LIST",
       };
@@ -689,8 +715,8 @@ export const testApi = {
   buildActivityEvents,
   buildRuntimeRepository,
   bundledSkillRepository,
+  classifyAgentRole,
   mergeSkillInventory,
-  normalizeAgentRoleClass,
   normalizeMcpReasonCode: normalizeObservabilityMcpReasonCode,
   normalizeSessionOutcome,
   normalizeTaskOutcome,

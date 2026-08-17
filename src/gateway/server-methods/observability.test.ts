@@ -431,11 +431,30 @@ describe("observability inventory metadata", () => {
   it.each([
     { input: { roleClass: "test" }, expected: "test" },
     { input: { roleClass: "unlisted" }, expected: "unlisted" },
-    { input: { kind: "system" }, expected: "system" },
-    { input: {}, expected: "user" },
-    { input: { roleClass: "invented" }, expected: "user" },
+    { input: { id: "agent-manager" }, expected: "user" },
+    { input: { id: "main" }, expected: "system" },
+    { input: { id: "onyx-21" }, expected: "user" },
+    { input: { id: "unknown-runtime-agent" }, expected: "unlisted" },
+    { input: { id: "unknown-runtime-agent", roleClass: "invented" }, expected: "unlisted" },
   ])("normalizes explicit agent role metadata to $expected", ({ input, expected }) => {
-    expect(testApi.normalizeAgentRoleClass(input)).toBe(expected);
+    expect(testApi.classifyAgentRole(input).roleClass).toBe(expected);
+  });
+
+  it.each([
+    {
+      input: { id: "agent-manager" },
+      expected: { roleClass: "user", roleClassSource: "stable-id" },
+    },
+    {
+      input: { id: "custom", roleClass: "test" },
+      expected: { roleClass: "test", roleClassSource: "runtime-explicit" },
+    },
+    {
+      input: { id: "custom" },
+      expected: { roleClass: "unlisted", roleClassSource: "default-unlisted" },
+    },
+  ])("exports auditable role metadata", ({ input, expected }) => {
+    expect(testApi.classifyAgentRole(input)).toEqual(expected);
   });
 
   it.each([
